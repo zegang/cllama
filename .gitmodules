@@ -7,3 +7,6 @@
 [submodule "third_party/oatpp"]
 	path = third_party/oatpp
 	url = git@github.com:zegang/oatpp.git
+[submodule "third_party/oatpp-swagger"]
+	path = third_party/oatpp-swagger
+	url = https://github.com/oatpp/oatpp-swagger.git

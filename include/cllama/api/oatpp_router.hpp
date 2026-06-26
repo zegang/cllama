@@ -14,7 +14,13 @@
 #include <oatpp/network/tcp/server/ConnectionProvider.hpp>
 #include <oatpp/json/ObjectMapper.hpp>
 #include <oatpp/macro/codegen.hpp>
+#include <oatpp/macro/component.hpp>
 #include <oatpp/Environment.hpp>
+
+#include <oatpp/web/protocol/http/outgoing/StreamingBody.hpp>
+#include <oatpp-swagger/Generator.hpp>
+#include <oatpp-swagger/Resources.hpp>
+#include <oatpp-swagger/Model.hpp>
 
 #include OATPP_CODEGEN_BEGIN(ApiController)
 
@@ -24,9 +30,15 @@ namespace api {
 class OatppController : public oatpp::web::server::api::ApiController {
 public:
     OatppController(const std::shared_ptr<ObjectMapper>& mapper,
-                    std::shared_ptr<RunnerManager> runner_mgr)
+                    std::shared_ptr<RunnerManager> runner_mgr,
+                    const oatpp::Object<oatpp::swagger::oas3::Document>& document,
+                    const std::shared_ptr<oatpp::swagger::Resources>& resources,
+                    const oatpp::String& apiJson)
         : oatpp::web::server::api::ApiController(mapper)
         , runner_mgr_(std::move(runner_mgr))
+        , m_document(document)
+        , m_resources(resources)
+        , m_apiJson(apiJson)
         , log_(cllama::util::get_logger("oatpp"))
     {
         log_->info("Controller initialized");
@@ -34,9 +46,13 @@ public:
 
     static std::shared_ptr<OatppController> createShared(
         const std::shared_ptr<ObjectMapper>& mapper,
-        std::shared_ptr<RunnerManager> runner_mgr)
+        std::shared_ptr<RunnerManager> runner_mgr,
+        const oatpp::Object<oatpp::swagger::oas3::Document>& document,
+        const std::shared_ptr<oatpp::swagger::Resources>& resources,
+        const oatpp::String& apiJson)
     {
-        return std::make_shared<OatppController>(mapper, std::move(runner_mgr));
+        return std::make_shared<OatppController>(mapper, std::move(runner_mgr),
+                                                  document, resources, apiJson);
     }
 
     // ── helpers ─────────────────────────────────────────────
@@ -440,6 +456,62 @@ public:
             nlohmann::json({{"status","error"}, {"error","delete not supported via API — use CLI"}}));
     }
 
+    // ── GET /openapi.json ────────────────────────────────────
+
+    ENDPOINT("GET", "/openapi.json", serveOpenApi) {
+        log_->info("GET /openapi.json");
+        return createDtoResponse(Status::CODE_200, m_document);
+    }
+
+    // ── GET /docs → redirect or serve ────────────────────────
+
+    ENDPOINT("GET", "/docs", serveDocs,
+             REQUEST(std::shared_ptr<oatpp::web::protocol::http::incoming::Request>, request))
+    {
+        auto& line = request->getStartingLine();
+        auto path = line.path.toString();
+        if (path && !path->empty() && path->back() == '/') {
+            log_->info("GET /docs/  → serving swagger UI");
+            return createResponse(Status::CODE_200,
+                m_resources->getResourceData("index.html"));
+        }
+        log_->info("GET /docs  → redirecting to /docs/");
+        auto response = createResponse(Status::CODE_302, "");
+        response->putHeader("Location", "/docs/");
+        return response;
+    }
+
+    // ── GET /docs/swagger-initializer.js (must be before {filename}) ─
+
+    ENDPOINT("GET", "/docs/swagger-initializer.js", serveSwaggerInit) {
+        std::string ui = m_resources->getResourceData("swagger-initializer.js");
+        auto pos = ui.find("%%API.JSON%%");
+        if (pos != std::string::npos) {
+            ui.replace(pos, 12, m_apiJson);
+        }
+        auto response = createResponse(Status::CODE_200, ui);
+        response->putHeader("Content-Type", "application/javascript");
+        return response;
+    }
+
+    // ── GET /docs/{filename} ──────────────────────────────────
+
+    ENDPOINT("GET", "/docs/{filename}", serveSwaggerResource,
+             PATH(String, filename))
+    {
+        auto file = m_resources->getResource(filename);
+        if (!file) {
+            log_->warn("GET /docs/{}  → 404", filename->c_str());
+            return createResponse(Status::CODE_404, "");
+        }
+        auto body = std::make_shared<oatpp::web::protocol::http::outgoing::StreamingBody>(
+            file->openInputStream()
+        );
+        auto resp = OutgoingResponse::createShared(Status::CODE_200, body);
+        resp->putHeader("Content-Type", m_resources->getMimeType(filename));
+        return resp;
+    }
+
 private:
     // ── response helpers ────────────────────────────────────
 
@@ -459,7 +531,12 @@ private:
     }
 
     std::shared_ptr<RunnerManager> runner_mgr_;
+    std::shared_ptr<oatpp::swagger::Resources> m_resources;
+    oatpp::String m_apiJson;
     std::shared_ptr<spdlog::logger> log_;
+
+public:
+    oatpp::Object<oatpp::swagger::oas3::Document> m_document;
 };
 
 #include OATPP_CODEGEN_END(ApiController)
@@ -474,11 +551,36 @@ public:
         auto log = cllama::util::get_logger("oatpp");
         log->info("OatppRouter starting on {}:{}", config_.host, config_.port);
 
+        // ── OpenAPI / Swagger document generation ────────────────
+        oatpp::swagger::DocumentInfo::Builder docBuilder;
+        docBuilder
+            .setTitle("CLLaMA API")
+            .setDescription("Local LLM Inference Server")
+            .setVersion("1.0.0")
+            .setContactName("CLLaMA Contributors")
+            .setLicenseName("MIT License")
+            .addServer("http://localhost:" + std::to_string(config_.port),
+                        "CLLaMA server (" + config_.host + ")");
+        auto doc = docBuilder.build();
+
+        auto resources = oatpp::swagger::Resources::loadResources(OATPP_SWAGGER_RES_PATH);
+
         auto objectMapper = std::make_shared<oatpp::json::ObjectMapper>();
-        auto controller = OatppController::createShared(objectMapper, runner_mgr_);
+        auto controller = OatppController::createShared(objectMapper, runner_mgr_,
+                                                        oatpp::Object<oatpp::swagger::oas3::Document>(),
+                                                        resources, "openapi.json");
+
+        oatpp::web::server::api::Endpoints docEndpoints;
+        docEndpoints.append(controller->getEndpoints());
+
+        oatpp::swagger::Generator generator(std::make_shared<oatpp::swagger::Generator::Config>());
+        auto document = generator.generateDocument(doc, docEndpoints);
+        controller->m_document = document;
 
         auto router = oatpp::web::server::HttpRouter::createShared();
         router->addController(controller);
+
+        log->info("OpenAPI spec at /openapi.json  Swagger UI at /docs/");
 
         auto connectionHandler = oatpp::web::server::HttpConnectionHandler::createShared(router);
         auto connectionProvider = oatpp::network::tcp::server::ConnectionProvider::createShared(

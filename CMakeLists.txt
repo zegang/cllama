@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.15)
+cmake_minimum_required(VERSION 3.20)
 project(CLLaMA VERSION 1.0.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -60,6 +60,25 @@ add_subdirectory(third_party/oatpp)
 # Suppress warnings in oatpp
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   target_compile_options(oatpp PRIVATE -Wno-error=format-truncation -Wno-error=unused-variable)
+endif()
+
+# oatpp-swagger – OpenAPI/Swagger support
+set(OATPP_MODULES_LOCATION "CUSTOM" CACHE STRING "Location where to find oatpp modules")
+set(OATPP_DIR_SRC "${CMAKE_SOURCE_DIR}/third_party/oatpp/src" CACHE STRING "Path to oatpp source dir")
+if(EXISTS "${CMAKE_SOURCE_DIR}/third_party/oatpp-swagger")
+  add_subdirectory(third_party/oatpp-swagger)
+else()
+  FetchContent_Declare(oatpp-swagger
+      GIT_REPOSITORY https://github.com/oatpp/oatpp-swagger.git
+      GIT_TAG 1.3.1)
+  FetchContent_MakeAvailable(oatpp-swagger)
+endif()
+
+# Pass swagger-ui resource path downstream
+if(oatpp-swagger_SOURCE_DIR)
+  set(OATPP_SWAGGER_RES_DIR "${oatpp-swagger_SOURCE_DIR}/res" CACHE INTERNAL "")
+else()
+  set(OATPP_SWAGGER_RES_DIR "${CMAKE_SOURCE_DIR}/third_party/oatpp-swagger/res" CACHE INTERNAL "")
 endif()
 
 # ── Application / Library ──────────────────────────────────

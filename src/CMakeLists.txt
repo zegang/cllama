@@ -24,16 +24,20 @@ add_library(cllama_lib
 )
 
 target_include_directories(cllama_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_definitions(cllama_lib PUBLIC OATPP_SWAGGER_RES_PATH="${OATPP_SWAGGER_RES_DIR}")
 
 target_link_libraries(cllama_lib PUBLIC
     Threads::Threads
     llama
     cpprest
     oatpp
+    oatpp-swagger
     httplib::httplib
     nlohmann_json::nlohmann_json
     spdlog::spdlog
 )
+
+
 
 if(WIN32 AND BUILD_SHARED_LIBS)
     target_compile_definitions(cllama_lib PRIVATE CLLAMA_EXPORTS)
