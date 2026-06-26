@@ -308,6 +308,60 @@ static CLlamaResult<std::string> parse_ndjson(const std::string& body) {
     return text;
 }
 
+// ── stream NDJSON parser ─────────────────────────────────────────
+
+struct StreamParseResult {
+    std::string text;
+    bool        ok = true;
+    std::string error;
+};
+
+/// Shared state for streaming NDJSON parsing across httplib ContentReceiver chunks.
+struct StreamCtx {
+    std::string             leftover;
+    std::string             full_text;
+    bool                    got_error = false;
+    std::string             error_msg;
+    bool                    got_done  = false;
+    RunnerManager::TokenCallback on_token;
+};
+
+static bool stream_parse_chunk(const char* data, size_t len, StreamCtx& ctx) {
+    ctx.leftover.append(data, len);
+    size_t pos = 0;
+    while (true) {
+        auto nl = ctx.leftover.find('\n', pos);
+        if (nl == std::string::npos) break;
+        std::string line = ctx.leftover.substr(pos, nl - pos);
+        pos = nl + 1;
+
+        if (line.empty()) continue;
+        try {
+            auto j = nlohmann::json::parse(line);
+            if (j.contains("error")) {
+                ctx.got_error = true;
+                ctx.error_msg = j["error"].get<std::string>();
+                return false;
+            }
+            if (j.contains("token") && ctx.on_token) {
+                auto t = j["token"].get<std::string>();
+                if (!ctx.on_token(t)) return false; // client aborted
+            }
+            if (j.value("done", false)) {
+                ctx.got_done  = true;
+                ctx.full_text = j.value("text", ctx.full_text);
+                // keep parsing in case there's more
+            }
+        } catch (...) {
+            ctx.got_error = true;
+            ctx.error_msg = "Invalid NDJSON from runner";
+            return false;
+        }
+    }
+    ctx.leftover.erase(0, pos);
+    return true;
+}
+
 // ── inference proxying ───────────────────────────────────────────
 
 CLlamaResult<std::string> RunnerManager::generate_completion(
@@ -371,6 +425,104 @@ CLlamaResult<std::string> RunnerManager::chat_completion(
     else
         log_->error("chat_completion('{}') failed: {}", model_name, result.error().message);
     return result;
+}
+
+// ── streaming inference ─────────────────────────────────────────
+
+CLlamaResult<std::string> RunnerManager::stream_completion(
+    const std::string& model_name,
+    const std::string& prompt,
+    const CompletionOptions& opts,
+    TokenCallback on_token)
+{
+    log_->info("stream_completion('{}')  prompt_len={}", model_name, prompt.size());
+    std::lock_guard<std::mutex> lk(mtx_);
+    PROXY_GUARD(r, model_name);
+
+    json body;
+    body["prompt"]  = prompt;
+    body["options"] = opts_to_json(opts);
+
+    StreamCtx ctx;
+    ctx.on_token = std::move(on_token);
+
+    httplib::Request req;
+    req.method = "POST";
+    req.path = "/api/completion";
+    req.set_header("Content-Type", "application/json");
+    req.body = body.dump();
+    req.content_receiver = [&](const char* data, size_t data_len, uint64_t, uint64_t) {
+        return stream_parse_chunk(data, data_len, ctx);
+    };
+
+    auto res = cli->send(req);
+
+    if (!res) {
+        log_->error("stream_completion('{}') — connection failed", model_name);
+        return Error(ErrorCode::NETWORK_ERROR, "Runner connection failed");
+    }
+    if (res->status != 200) {
+        log_->error("stream_completion('{}') — HTTP {}", model_name, res->status);
+        return Error(ErrorCode::NETWORK_ERROR,
+                     "Runner request failed: HTTP " + std::to_string(res->status));
+    }
+    if (ctx.got_error) {
+        log_->error("stream_completion('{}') — runner error: {}", model_name, ctx.error_msg);
+        return Error(ErrorCode::MODEL_ERROR, ctx.error_msg);
+    }
+
+    log_->info("stream_completion('{}') success  size={}", model_name, ctx.full_text.size());
+    return ctx.full_text;
+}
+
+CLlamaResult<std::string> RunnerManager::stream_chat(
+    const std::string& model_name,
+    const std::vector<Message>& messages,
+    const CompletionOptions& opts,
+    TokenCallback on_token)
+{
+    log_->info("stream_chat('{}')  messages={}", model_name, messages.size());
+    std::lock_guard<std::mutex> lk(mtx_);
+    PROXY_GUARD(r, model_name);
+
+    json msgs = json::array();
+    for (const auto& m : messages)
+        msgs.push_back({{"role", m.role}, {"content", m.content}});
+
+    json body;
+    body["messages"] = msgs;
+    body["options"]  = opts_to_json(opts);
+
+    StreamCtx ctx;
+    ctx.on_token = std::move(on_token);
+
+    httplib::Request req;
+    req.method = "POST";
+    req.path = "/api/chat";
+    req.set_header("Content-Type", "application/json");
+    req.body = body.dump();
+    req.content_receiver = [&](const char* data, size_t data_len, uint64_t, uint64_t) {
+        return stream_parse_chunk(data, data_len, ctx);
+    };
+
+    auto res = cli->send(req);
+
+    if (!res) {
+        log_->error("stream_chat('{}') — connection failed", model_name);
+        return Error(ErrorCode::NETWORK_ERROR, "Runner connection failed");
+    }
+    if (res->status != 200) {
+        log_->error("stream_chat('{}') — HTTP {}", model_name, res->status);
+        return Error(ErrorCode::NETWORK_ERROR,
+                     "Runner chat failed: HTTP " + std::to_string(res->status));
+    }
+    if (ctx.got_error) {
+        log_->error("stream_chat('{}') — runner error: {}", model_name, ctx.error_msg);
+        return Error(ErrorCode::MODEL_ERROR, ctx.error_msg);
+    }
+
+    log_->info("stream_chat('{}') success  size={}", model_name, ctx.full_text.size());
+    return ctx.full_text;
 }
 
 CLlamaResult<Embedding> RunnerManager::generate_embeddings(

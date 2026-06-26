@@ -71,6 +71,9 @@ public:
 
     // ── inference (proxy to runner) ────────────────────────────
 
+    /// on_token returns `true` to continue, `false` to abort.
+    using TokenCallback = std::function<bool(const std::string& token)>;
+
     CLlamaResult<std::string> generate_completion(
         const std::string& model_name,
         const std::string& prompt,
@@ -80,6 +83,21 @@ public:
         const std::string& model_name,
         const std::vector<Message>& messages,
         const CompletionOptions& opts);
+
+    /// Streaming variant: calls on_token for each token as it arrives.
+    /// Blocks until the stream ends. Returns the full text on success.
+    CLlamaResult<std::string> stream_completion(
+        const std::string& model_name,
+        const std::string& prompt,
+        const CompletionOptions& opts,
+        TokenCallback on_token);
+
+    /// Streaming variant for chat.
+    CLlamaResult<std::string> stream_chat(
+        const std::string& model_name,
+        const std::vector<Message>& messages,
+        const CompletionOptions& opts,
+        TokenCallback on_token);
 
     CLlamaResult<Embedding> generate_embeddings(
         const std::string& model_name,

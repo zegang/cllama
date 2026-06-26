@@ -42,3 +42,6 @@ logs/
 *.iml
 *.iws
 out/
+
+# local test models
+models/

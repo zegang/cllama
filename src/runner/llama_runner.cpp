@@ -1,10 +1,12 @@
 #include <string>
 #include <sstream>
 #include <vector>
+#include <deque>
 #include <random>
 #include <cstring>
 #include <csignal>
 #include <functional>
+#include <thread>
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 #include <cllama/util/log.hpp>
@@ -194,40 +196,139 @@ int main(int argc, char* argv[]) {
         res.set_content(R"({"status":"ok"})", "application/json");
     });
 
-    // /api/completion  —  NDJSON: each token is {"token":"..."}, final line is {"done":true,"text":"..."}
-    svr.Post("/api/completion", [model](const httplib::Request& req, httplib::Response& res) {
+    // ── shared streaming state ─────────────────────────────────────
+
+    struct TokenStream {
+        std::mutex              mtx;
+        std::condition_variable cv;
+        std::deque<std::string> tokens;
+        std::string             text;
+        bool                    done    = false;
+        bool                    aborted = false;
+    };
+
+    auto stream_content_provider = [](std::shared_ptr<TokenStream> ts) {
+        return [ts](size_t /*offset*/, httplib::DataSink& sink) -> bool {
+            std::unique_lock<std::mutex> lk(ts->mtx);
+            ts->cv.wait(lk, [ts]() {
+                return !ts->tokens.empty() || ts->done || ts->aborted;
+            });
+
+            if (ts->aborted) return false;
+
+            while (!ts->tokens.empty()) {
+                std::string line = json{{"token", ts->tokens.front()}}.dump() + "\n";
+                ts->tokens.pop_front();
+                lk.unlock();
+                if (!sink.write(line.data(), line.size())) {
+                    lk.lock();
+                    ts->aborted = true;
+                    ts->cv.notify_all();
+                    return false;
+                }
+                lk.lock();
+            }
+
+            if (ts->done) {
+                std::string final_line = json{{"done", true}, {"text", ts->text}}.dump() + "\n";
+                lk.unlock();
+                sink.write(final_line.data(), final_line.size());
+                sink.done();
+                return false;
+            }
+
+            return true;
+        };
+    };
+
+    auto stream_done_cb = [](std::shared_ptr<TokenStream> ts) {
+        return [ts](bool /*success*/) {
+            std::lock_guard<std::mutex> lk(ts->mtx);
+            ts->aborted = true;
+            ts->cv.notify_all();
+        };
+    };
+
+    auto on_token_push = [](std::shared_ptr<TokenStream> ts) {
+        return [ts](const std::string& t) {
+            std::lock_guard<std::mutex> lk(ts->mtx);
+            if (ts->aborted) return;
+            ts->tokens.push_back(t);
+            ts->cv.notify_one();
+        };
+    };
+
+    // /api/completion  —  NDJSON streaming
+    svr.Post("/api/completion", [model, stream_content_provider, stream_done_cb](const httplib::Request& req, httplib::Response& res) {
         try {
-            auto j = json::parse(req.body);
+            auto j      = json::parse(req.body);
             auto prompt = j["prompt"].get<std::string>();
             auto opts   = opts_from_json(j.value("options", json::object()));
-            std::string ndjson;
-            auto on_token = [&](const std::string& t) {
-                ndjson += json{{"token", t}}.dump() + "\n";
-            };
-            auto text = generate(model, prompt, opts, false, on_token);
-            ndjson += json{{"done", true}, {"text", text}}.dump() + "\n";
-            res.set_content(ndjson, "application/x-ndjson");
+            auto ts     = std::make_shared<TokenStream>();
+
+            std::thread([model, prompt, opts, ts]() {
+                try {
+                    auto on_token = [ts](const std::string& t) {
+                        std::lock_guard<std::mutex> lk(ts->mtx);
+                        if (ts->aborted) return;
+                        ts->tokens.push_back(t);
+                        ts->cv.notify_one();
+                    };
+                    auto text = generate(model, prompt, opts, false, on_token);
+                    std::lock_guard<std::mutex> lk(ts->mtx);
+                    ts->text = std::move(text);
+                    ts->done = true;
+                    ts->cv.notify_one();
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(ts->mtx);
+                    ts->text = e.what();
+                    ts->done = true;
+                    ts->cv.notify_one();
+                }
+            }).detach();
+
+            res.set_content_provider("application/x-ndjson",
+                                     stream_content_provider(ts),
+                                     stream_done_cb(ts));
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
         }
     });
 
-    // /api/chat  —  NDJSON: same format as /api/completion
-    svr.Post("/api/chat", [model, chat_template](const httplib::Request& req, httplib::Response& res) {
+    // /api/chat  —  NDJSON streaming
+    svr.Post("/api/chat", [model, chat_template, stream_content_provider, stream_done_cb](const httplib::Request& req, httplib::Response& res) {
         try {
-            auto j       = json::parse(req.body);
-            auto msgs    = j["messages"];
-            auto opts    = opts_from_json(j.value("options", json::object()));
-            // per-request template override; fall back to --chat-template
+            auto j    = json::parse(req.body);
+            auto msgs = j["messages"];
+            auto opts = opts_from_json(j.value("options", json::object()));
             auto tmpl = j.value("chat_template", chat_template);
-            std::string ndjson;
-            auto on_token = [&](const std::string& t) {
-                ndjson += json{{"token", t}}.dump() + "\n";
-            };
-            auto text = chat(model, msgs, opts, tmpl, on_token);
-            ndjson += json{{"done", true}, {"text", text}}.dump() + "\n";
-            res.set_content(ndjson, "application/x-ndjson");
+            auto ts   = std::make_shared<TokenStream>();
+
+            std::thread([model, msgs, opts, tmpl, ts]() {
+                try {
+                    auto on_token = [ts](const std::string& t) {
+                        std::lock_guard<std::mutex> lk(ts->mtx);
+                        if (ts->aborted) return;
+                        ts->tokens.push_back(t);
+                        ts->cv.notify_one();
+                    };
+                    auto text = chat(model, msgs, opts, tmpl, on_token);
+                    std::lock_guard<std::mutex> lk(ts->mtx);
+                    ts->text = std::move(text);
+                    ts->done = true;
+                    ts->cv.notify_one();
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> lk(ts->mtx);
+                    ts->text = e.what();
+                    ts->done = true;
+                    ts->cv.notify_one();
+                }
+            }).detach();
+
+            res.set_content_provider("application/x-ndjson",
+                                     stream_content_provider(ts),
+                                     stream_done_cb(ts));
         } catch (const std::exception& e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");

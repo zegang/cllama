@@ -27,6 +27,53 @@
 namespace cllama {
 namespace api {
 
+// ── I/O pipe ────────────────────────────────────────────────────
+// ReadCallback that buffers writes from a background thread;
+// oatpp StreamingBody reads from it to produce per-token SSE.
+
+class IOPipe : public oatpp::data::stream::ReadCallback {
+public:
+    static constexpr size_t MAX_BUFFER = 1024 * 1024; // 1MB watermark ⇒ client likely gone
+
+    oatpp::v_io_size read(void *buffer, ::v_buff_size count, oatpp::async::Action& action) override {
+        std::unique_lock<std::mutex> lk(mtx_);
+        cv_.wait(lk, [this] { return !buf_.empty() || done_; });
+        if (buf_.empty()) return 0;
+        auto n = std::min<::v_buff_size>(count, static_cast<::v_buff_size>(buf_.size()));
+        std::memcpy(buffer, buf_.data(), static_cast<size_t>(n));
+        buf_.erase(buf_.begin(), buf_.begin() + n);
+        cv_.notify_one();
+        return n;
+    }
+
+    /// Returns false if the pipe has been aborted (client likely disconnected).
+    bool write(const char* data, size_t len) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (aborted_ || done_) return false;
+        buf_.insert(buf_.end(), data, data + len);
+        if (buf_.size() > MAX_BUFFER) {
+            aborted_ = true;
+        }
+        cv_.notify_one();
+        return !aborted_;
+    }
+
+    void close() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        done_ = true;
+        cv_.notify_all();
+    }
+
+    bool is_aborted() const { return aborted_; }
+
+private:
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::vector<char> buf_;
+    bool done_    = false;
+    bool aborted_ = false;
+};
+
 class OatppController : public oatpp::web::server::api::ApiController {
 public:
     OatppController(const std::shared_ptr<ObjectMapper>& mapper,
@@ -200,30 +247,46 @@ public:
             opts.temperature = jbody["temperature"].get<float>();
 
         if (stream) {
-            auto result = runner_mgr_->generate_completion(model, prompt, opts);
+            auto pipe = std::make_shared<IOPipe>();
             auto stream_id = "cmpl-" + std::to_string(now_epoch());
             auto ts = now_epoch();
-            std::string sse_data;
-            if (result.success()) {
-                auto text = result.get();
-                log_->info("Completion stream success  size={}", text.size());
-                sse_data = "{"
-                    "\"id\":\"" + stream_id + "\","
-                    "\"object\":\"text_completion\","
-                    "\"created\":" + std::to_string(ts) + ","
-                    "\"model\":\"" + model + "\","
-                    "\"choices\":[{"
-                        "\"text\":\"" + escape_json(text) + "\","
-                        "\"index\":0,"
-                        "\"logprobs\":null,"
-                        "\"finish_reason\":\"stop\""
-                    "}]}";
-            } else {
-                log_->error("Completion stream failed: {}", result.error().message);
-                sse_data = "{\"error\":\"" + escape_json(result.error().message) + "\"}";
-            }
-            auto body = std::string("data: ") + sse_data + "\n\n" + "data: [DONE]\n\n";
-            return sse_response(body);
+
+            std::thread([this, pipe, model, prompt, opts, stream_id, ts]() {
+                try {
+                    auto result = runner_mgr_->stream_completion(model, prompt, opts,
+                        [pipe, stream_id, ts, model](const std::string& token) -> bool {
+                            nlohmann::json event;
+                            event["id"] = stream_id;
+                            event["object"] = "text_completion";
+                            event["created"] = ts;
+                            event["model"] = model;
+                            event["choices"] = nlohmann::json::array({nlohmann::json{
+                                {"text", token},
+                                {"index", 0},
+                                {"logprobs", nullptr},
+                                {"finish_reason", nullptr}
+                            }});
+                            auto sse = "data: " + event.dump() + "\n\n";
+                            return pipe->write(sse.data(), sse.size());
+                        }
+                    );
+                    if (!result.success()) {
+                        nlohmann::json err;
+                        err["error"] = result.error().message;
+                        auto sse = "data: " + err.dump() + "\n\n";
+                        pipe->write(sse.data(), sse.size());
+                    }
+                } catch (const std::exception& e) {
+                    nlohmann::json err;
+                    err["error"] = e.what();
+                    auto sse = "data: " + err.dump() + "\n\n";
+                    pipe->write(sse.data(), sse.size());
+                }
+                pipe->write("data: [DONE]\n\n", 14);
+                pipe->close();
+            }).detach();
+
+            return stream_response(pipe);
         }
 
         auto result = runner_mgr_->generate_completion(model, prompt, opts);
@@ -282,42 +345,61 @@ public:
             opts.max_tokens = jbody["max_tokens"].get<int>();
 
         if (stream) {
-            auto result = runner_mgr_->chat_completion(model, messages, opts);
+            auto pipe = std::make_shared<IOPipe>();
             auto stream_id = "chatcmpl-" + std::to_string(now_epoch());
             auto ts = now_epoch();
-            std::string body_out;
-            if (result.success()) {
-                auto content = result.get();
-                log_->info("Chat stream success  size={}", content.size());
-                auto role_event = "{"
-                    "\"id\":\"" + stream_id + "\","
-                    "\"object\":\"chat.completion.chunk\","
-                    "\"created\":" + std::to_string(ts) + ","
-                    "\"model\":\"" + model + "\","
-                    "\"choices\":[{"
-                        "\"delta\":{\"role\":\"assistant\"},"
-                        "\"index\":0,"
-                        "\"finish_reason\":null"
-                    "}]}";
-                auto content_event = "{"
-                    "\"id\":\"" + stream_id + "\","
-                    "\"object\":\"chat.completion.chunk\","
-                    "\"created\":" + std::to_string(ts) + ","
-                    "\"model\":\"" + model + "\","
-                    "\"choices\":[{"
-                        "\"delta\":{\"content\":\"" + escape_json(content) + "\"},"
-                        "\"index\":0,"
-                        "\"finish_reason\":\"stop\""
-                    "}]}";
-                body_out = "data: " + role_event + "\n\n"
-                         + "data: " + content_event + "\n\n"
-                         + "data: [DONE]\n\n";
-            } else {
-                log_->error("Chat stream failed: {}", result.error().message);
-                body_out = "data: {\"error\":\"" + escape_json(result.error().message) + "\"}\n\n"
-                         + "data: [DONE]\n\n";
-            }
-            return sse_response(body_out);
+
+            std::thread([this, pipe, model, messages, opts, stream_id, ts]() {
+                try {
+                    // Role event
+                    {
+                        nlohmann::json role_event;
+                        role_event["id"] = stream_id;
+                        role_event["object"] = "chat.completion.chunk";
+                        role_event["created"] = ts;
+                        role_event["model"] = model;
+                        role_event["choices"] = nlohmann::json::array({nlohmann::json{
+                            {"delta", {{"role", "assistant"}}},
+                            {"index", 0},
+                            {"finish_reason", nullptr}
+                        }});
+                        auto sse = "data: " + role_event.dump() + "\n\n";
+                        pipe->write(sse.data(), sse.size());
+                    }
+
+                    auto result = runner_mgr_->stream_chat(model, messages, opts,
+                        [pipe, stream_id, ts, model](const std::string& token) -> bool {
+                            nlohmann::json event;
+                            event["id"] = stream_id;
+                            event["object"] = "chat.completion.chunk";
+                            event["created"] = ts;
+                            event["model"] = model;
+                            event["choices"] = nlohmann::json::array({nlohmann::json{
+                                {"delta", {{"content", token}}},
+                                {"index", 0},
+                                {"finish_reason", nullptr}
+                            }});
+                            auto sse = "data: " + event.dump() + "\n\n";
+                            return pipe->write(sse.data(), sse.size());
+                        }
+                    );
+                    if (!result.success()) {
+                        nlohmann::json err;
+                        err["error"] = result.error().message;
+                        auto sse = "data: " + err.dump() + "\n\n";
+                        pipe->write(sse.data(), sse.size());
+                    }
+                } catch (const std::exception& e) {
+                    nlohmann::json err;
+                    err["error"] = e.what();
+                    auto sse = "data: " + err.dump() + "\n\n";
+                    pipe->write(sse.data(), sse.size());
+                }
+                pipe->write("data: [DONE]\n\n", 14);
+                pipe->close();
+            }).detach();
+
+            return stream_response(pipe);
         }
 
         auto result = runner_mgr_->chat_completion(model, messages, opts);
@@ -527,6 +609,15 @@ private:
         response->putHeader("Content-Type", "text/event-stream");
         response->putHeader("Cache-Control", "no-cache");
         response->putHeader("Connection", "keep-alive");
+        return response;
+    }
+
+    std::shared_ptr<OutgoingResponse> stream_response(std::shared_ptr<IOPipe> pipe) {
+        auto body = std::make_shared<oatpp::web::protocol::http::outgoing::StreamingBody>(pipe);
+        auto response = OutgoingResponse::createShared(Status::CODE_200, body);
+        response->putHeader(Header::CONTENT_TYPE, "text/event-stream");
+        response->putHeader("Cache-Control", "no-cache");
+        response->putHeader(Header::CONNECTION, "keep-alive");
         return response;
     }
 

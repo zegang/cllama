@@ -2,6 +2,7 @@
 #define CLlama_API_CPPREST_ROUTER_HPP
 
 #include "cllama/api/router.hpp"
+#include <nlohmann/json.hpp>
 #include <cpprest/http_listener.h>
 #include <cpprest/json.h>
 #include <cpprest/producerconsumerstream.h>
@@ -213,25 +214,30 @@ private:
 
             request.reply(resp);
 
-            auto result = runner_mgr_->generate_completion(model, prompt, opts);
-            if (result.success()) {
-                auto text = result.get();
-                auto sse_data = std::string("{")
-                    + "\"id\":\"" + stream_id + "\","
-                    + "\"object\":\"text_completion\","
-                    + "\"created\":" + std::to_string(ts) + ","
-                    + "\"model\":\"" + model + "\","
-                    + "\"choices\":[{"
-                        + "\"text\":\"" + escape_json(text) + "\","
-                        + "\"index\":0,"
-                        + "\"logprobs\":null,"
-                        + "\"finish_reason\":\"stop\""
-                    + "}]}";
-                auto sse = std::string("data: ") + sse_data + "\n\n";
-                buf->putn_nocopy(reinterpret_cast<const uint8_t*>(sse.data()), sse.size()).wait();
-            } else {
-                auto err = std::string("data: {\"error\":\"")
-                    + escape_json(result.error().message) + "\"}\n\n";
+            auto on_token = [buf, stream_id, ts, model](const std::string& token) -> bool {
+                nlohmann::json event;
+                event["id"] = stream_id;
+                event["object"] = "text_completion";
+                event["created"] = ts;
+                event["model"] = model;
+                event["choices"] = nlohmann::json::array({nlohmann::json{
+                    {"text", token},
+                    {"index", 0},
+                    {"logprobs", nullptr},
+                    {"finish_reason", nullptr}
+                }});
+                auto sse = std::string("data: ") + event.dump() + "\n\n";
+                try {
+                    buf->putn_nocopy(reinterpret_cast<const uint8_t*>(sse.data()), sse.size()).wait();
+                    return true;
+                } catch (...) {
+                    return false;
+                }
+            };
+
+            auto result = runner_mgr_->stream_completion(model, prompt, opts, on_token);
+            if (!result.success()) {
+                auto err = "data: {\"error\":\"" + escape_json(result.error().message) + "\"}\n\n";
                 buf->putn_nocopy(reinterpret_cast<const uint8_t*>(err.data()), err.size()).wait();
             }
             auto done = std::string("data: [DONE]\n\n");
@@ -294,36 +300,45 @@ private:
 
             request.reply(resp);
 
-            auto result = runner_mgr_->chat_completion(model, messages, opts);
-            if (result.success()) {
-                auto content = result.get();
-                auto role_data = std::string("{")
-                    + "\"id\":\"" + stream_id + "\","
-                    + "\"object\":\"chat.completion.chunk\","
-                    + "\"created\":" + std::to_string(ts) + ","
-                    + "\"model\":\"" + model + "\","
-                    + "\"choices\":[{"
-                        + "\"delta\":{\"role\":\"assistant\"},"
-                        + "\"index\":0,"
-                        + "\"finish_reason\":null"
-                    + "}]}";
-                auto role_sse = std::string("data: ") + role_data + "\n\n";
+            // Role event
+            {
+                nlohmann::json role_event;
+                role_event["id"] = stream_id;
+                role_event["object"] = "chat.completion.chunk";
+                role_event["created"] = ts;
+                role_event["model"] = model;
+                role_event["choices"] = nlohmann::json::array({nlohmann::json{
+                    {"delta", {{"role", "assistant"}}},
+                    {"index", 0},
+                    {"finish_reason", nullptr}
+                }});
+                auto role_sse = std::string("data: ") + role_event.dump() + "\n\n";
                 buf->putn_nocopy(reinterpret_cast<const uint8_t*>(role_sse.data()), role_sse.size()).wait();
-                auto content_data = std::string("{")
-                    + "\"id\":\"" + stream_id + "\","
-                    + "\"object\":\"chat.completion.chunk\","
-                    + "\"created\":" + std::to_string(ts) + ","
-                    + "\"model\":\"" + model + "\","
-                    + "\"choices\":[{"
-                        + "\"delta\":{\"content\":\"" + escape_json(content) + "\"},"
-                        + "\"index\":0,"
-                        + "\"finish_reason\":\"stop\""
-                    + "}]}";
-                auto content_sse = std::string("data: ") + content_data + "\n\n";
-                buf->putn_nocopy(reinterpret_cast<const uint8_t*>(content_sse.data()), content_sse.size()).wait();
-            } else {
-                auto err = std::string("data: {\"error\":\"")
-                    + escape_json(result.error().message) + "\"}\n\n";
+            }
+
+            auto on_token = [buf, stream_id, ts, model](const std::string& token) -> bool {
+                nlohmann::json event;
+                event["id"] = stream_id;
+                event["object"] = "chat.completion.chunk";
+                event["created"] = ts;
+                event["model"] = model;
+                event["choices"] = nlohmann::json::array({nlohmann::json{
+                    {"delta", {{"content", token}}},
+                    {"index", 0},
+                    {"finish_reason", nullptr}
+                }});
+                auto sse = std::string("data: ") + event.dump() + "\n\n";
+                try {
+                    buf->putn_nocopy(reinterpret_cast<const uint8_t*>(sse.data()), sse.size()).wait();
+                    return true;
+                } catch (...) {
+                    return false;
+                }
+            };
+
+            auto result = runner_mgr_->stream_chat(model, messages, opts, on_token);
+            if (!result.success()) {
+                auto err = "data: {\"error\":\"" + escape_json(result.error().message) + "\"}\n\n";
                 buf->putn_nocopy(reinterpret_cast<const uint8_t*>(err.data()), err.size()).wait();
             }
             auto done = std::string("data: [DONE]\n\n");
