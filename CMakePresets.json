@@ -1,0 +1,111 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name":          "default",
+            "displayName":   "Linux (default)",
+            "description":   "Default Linux build with GCC/Clang",
+            "generator":     "Unix Makefiles",
+            "binaryDir":     "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_SHARED_LIBS": "ON"
+            }
+        },
+        {
+            "name":          "linux",
+            "displayName":   "Linux",
+            "inherits":      "default"
+        },
+        {
+            "name":          "macos",
+            "displayName":   "macOS",
+            "description":   "macOS build with Apple Clang",
+            "generator":     "Unix Makefiles",
+            "binaryDir":     "${sourceDir}/build_macos",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "BUILD_SHARED_LIBS": "ON"
+            }
+        },
+        {
+            "name":          "ios",
+            "displayName":   "iOS",
+            "description":   "iOS cross-compile with Xcode generator",
+            "generator":     "Xcode",
+            "binaryDir":     "${sourceDir}/build_ios",
+            "cacheVariables": {
+                "CMAKE_SYSTEM_NAME":  "iOS",
+                "CMAKE_OSX_SYSROOT":  "iphoneos",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "BUILD_SHARED_LIBS":  "OFF"
+            }
+        },
+        {
+            "name":          "android",
+            "displayName":   "Android",
+            "description":   "Android NDK cross-compile (set ANDROID_NDK env var)",
+            "generator":     "Ninja",
+            "binaryDir":     "${sourceDir}/build_android",
+            "cacheVariables": {
+                "CMAKE_SYSTEM_NAME":           "Android",
+                "CMAKE_ANDROID_ARCH_ABI":      "arm64-v8a",
+                "CMAKE_ANDROID_NDK":           "$env{ANDROID_NDK}",
+                "CMAKE_ANDROID_STL_TYPE":      "c++_shared",
+                "CMAKE_ANDROID_API":           "26",
+                "BUILD_SHARED_LIBS":           "OFF"
+            }
+        },
+        {
+            "name":          "windows",
+            "displayName":   "Windows",
+            "description":   "Windows build with MSVC",
+            "generator":     "Visual Studio 17 2022",
+            "binaryDir":     "${sourceDir}/build_windows",
+            "architecture":  "x64",
+            "cacheVariables": {
+                "BUILD_SHARED_LIBS": "ON"
+            }
+        },
+        {
+            "name":          "windows-static",
+            "displayName":   "Windows (static)",
+            "description":   "Windows static build with MSVC",
+            "inherits":      "windows",
+            "binaryDir":     "${sourceDir}/build_windows_static",
+            "cacheVariables": {
+                "BUILD_SHARED_LIBS": "OFF"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "default",
+            "configurePreset": "default"
+        },
+        {
+            "name": "linux",
+            "configurePreset": "linux"
+        },
+        {
+            "name": "macos",
+            "configurePreset": "macos"
+        },
+        {
+            "name": "ios",
+            "configurePreset": "ios"
+        },
+        {
+            "name": "android",
+            "configurePreset": "android"
+        },
+        {
+            "name": "windows",
+            "configurePreset": "windows"
+        },
+        {
+            "name": "windows-static",
+            "configurePreset": "windows-static"
+        }
+    ]
+}

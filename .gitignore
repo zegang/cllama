@@ -1,0 +1,44 @@
+node_modules/
+*.log
+temp/
+*.pyc
+__pycache__/
+*.so
+*.dylib
+*.dll
+.idea/
+.vscode/
+*.swp
+*.swo
+swap*
+*.orig
+*.rej
+*.bak
+*.backup
+.DS_Store
+desktop.ini
+
+# Build directories
+build/
+develop/
+dist/
+*.manifest
+doxygen_html/
+latex_html/
+
+# Crash reports
+*.stackdump
+
+# Logs
+logs/
+*.log.gz
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+
+# IntelliJ
+*.iml
+*.iws
+out/
