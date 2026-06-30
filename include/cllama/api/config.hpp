@@ -11,7 +11,7 @@ namespace api {
 
 struct ServerConfig {
     std::string host = "0.0.0.0";
-    int port = 8080;
+    int port = 9027;
     std::string model_path = "/tmp/cllama/models";
     int max_request_workers = 4;
     int request_queue_max_size = 1000;
