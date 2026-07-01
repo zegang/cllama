@@ -1,6 +1,6 @@
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
-	url = git@github.com:zegang/llama.cpp.git
+	url = https://github.com/zegang/llama.cpp.git
 [submodule "third_party/cpprestsdk"]
 	path = third_party/cpprestsdk
 	url = git@github.com:zegang/cpprestsdk.git

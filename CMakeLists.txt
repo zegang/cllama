@@ -55,7 +55,14 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 # oatpp – C++ web framework
-add_subdirectory(third_party/oatpp)
+# Allow reusing an external oatpp build to avoid duplicate compilation.
+# Set CLLAMA_OATPP_SOURCE_DIR to the oatpp source root (e.g. ../../vendor/oatpp).
+if(CLLAMA_OATPP_SOURCE_DIR)
+    message(STATUS "CLLaMA: Using external oatpp at ${CLLAMA_OATPP_SOURCE_DIR}")
+    add_subdirectory(${CLLAMA_OATPP_SOURCE_DIR} ${CMAKE_BINARY_DIR}/oatpp)
+else()
+    add_subdirectory(third_party/oatpp)
+endif()
 
 # Suppress warnings in oatpp
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
